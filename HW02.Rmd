@@ -1,0 +1,703 @@
+---
+title: "HW02_Machine Learning for Finance"
+author: "Shayan Abbasi"
+date: "6/10/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Import Data and Packages
+```{r}
+library(lpSolve)
+library(fPortfolio)
+require(PortfolioAnalytics)
+require(GenSA)
+require(DEoptim)
+require(quantmod)
+require(plyr)
+library(xts)
+library(zoo)
+library(quantmod) # data, plotting, quant modelling
+library(PerformanceAnalytics) # performance and risk management
+library(matrixStats)
+library(doParallel)
+rm(list=ls())
+# reading data and subsetting date interval
+#zip.file <- unzip("data.zip")
+amzn <- read.csv("./data/AMZN.csv", sep = ",", header = TRUE)
+data <- read.csv("dataset.csv", sep = ",", header = TRUE)
+colnames(data)[1] <- 'Date'
+time_interval <- c("2018-01-01", "2019-12-31")
+data$Date <- as.Date(data$Date, format= "%Y-%m-%d")
+data <- subset(data, Date> time_interval[1] & Date< time_interval[2])
+data <- as.xts(zoo(as.matrix(data[,2:46]), as.Date(as.character(data[,1]))))
+
+# AMZN Price data and sentiment indicators:
+amzn$Date <- as.Date(amzn$Date, format= "%Y-%m-%d")
+amzn <- subset(amzn, Date> time_interval[1] & Date < time_interval[2])
+amzn <- as.xts(zoo(as.matrix(amzn[,3:17]), as.Date(as.character(amzn[,2]))))
+
+target <- amzn$Adj.Close
+names(target) <- "AMZN"
+ 
+positivePartscr= na.omit(amzn$positivePartscr)
+names(positivePartscr)<- "positivePartscr"
+certaintyPartscr= na.omit(amzn$certaintyPartscr)
+names(certaintyPartscr)<- "certaintyPartscr"
+finupPartscr= na.omit(amzn$finupPartscr)
+names(finupPartscr)<- "finupPartscr"
+negativePartscr= na.omit(amzn$negativePartscr)
+names(negativePartscr)<- "negativePartscr"
+uncertaintyPartscr= na.omit(amzn$uncertaintyPartscr)
+names(uncertaintyPartscr)<- "uncertaintyPartscr"
+uncertaintyPartscr= na.omit(amzn$uncertaintyPartscr)
+names(uncertaintyPartscr)<- "uncertaintyPartscr"
+findownPartscr= na.omit(amzn$findownPartscr)
+names(findownPartscr)<- "findownPartscr"
+
+bull <- positivePartscr+certaintyPartscr+finupPartscr
+bear <- negativePartscr+uncertaintyPartscr+findownPartscr
+bbr <- data$BBr.AMZN #1 NA value so we calculate and use extend to fill NA.
+bbr <- na.fill(100*bull/(bull+bear), 'extend')
+pnlog <- data$PNlog.AMZN #1 NA value so we calculate and use extend to fill NA.
+pnlog <- na.fill(0.5*log((amzn$positivePartscr+1)/(amzn$negativePartscr+1)), 'extend')
+
+s <- c(5,10,15,20)
+m <- c(25,50,100)
+win_size <- c(254, 127)
+long_short <- c(0,1)
+exp_val <- cbind(bull, bear, bbr, pnlog)
+colnames(exp_val) <- c('bull', 'bear', 'bbr', 'pnlog')
+```
+
+# Performance and backtesting provided functions
+```{r}
+##Performance Measures for Trading strategies
+Performance <- function(x) {
+  cumRetx = Return.cumulative(x,geometric = TRUE)
+  annRetx = Return.annualized(x, scale=252)
+  sharpex = SharpeRatio.annualized(x, scale=252)
+  winpctx = length(x[x > 0])/length(x[x != 0])
+  annSDx = sd.annualized(x, scale=252)
+  
+  DDs <- findDrawdowns(x)
+  maxDDx = min(DDs$return)
+  maxLx = max(DDs$length)
+  
+  Perf = c(cumRetx, annRetx, sharpex, winpctx, annSDx, maxDDx, maxLx)
+  names(Perf) = c("Cumulative Return", "Annual Return","Annualized Sharpe Ratio",
+                  "Win %", "Annualized Volatility", "Maximum Drawdown", "Max Length Drawdown")
+  return(Perf)
+}
+
+testMAStrategy <- function(myStock,ts =myStock,s=5, m=20,longshort=0) {
+  ##Create signal: for s<m, MA(s)>MA(m) long (1), else short (-1) (if no shorting allow use 0 instead of -1)
+  # Lag so yesterday's signal is applied to today's returns
+  myPosition <- sig <- Lag(ifelse(SMA(ts,s)>SMA(ts,m), 1, longshort),1)
+  bmkReturns <- dailyReturn(myStock, type = "arithmetic")
+  myReturns <- bmkReturns*sig
+  names(bmkReturns) <- 'BH'
+  names(myReturns) <- 'MAx'
+  tt <- na.omit(merge(bmkReturns,myReturns))
+  ##Performance
+  charts.PerformanceSummary(cbind(tt$MAx,tt$BH), main=paste(names(ts),".on.",names(myStock)," MAcrossover",sep=""))
+  cbind(MAx=Performance(tt$MAx),BH=Performance(tt$BH))
+}
+
+##Average Performance of MA crossover over short (1 yr, 6 mon) fixed length periods
+##using Rolling windows. Window size 252 (a year of daily data) or 252/2 for 6 mon
+RollingTestMAStrategy <- function(myStock,ts =myStock,s=5, m=20,longshort=0,w_size=252) {
+  myPosition <- sig <- Lag(ifelse(SMA(ts,s)>SMA(ts,m), 1, longshort),1)
+  bmkReturns <- dailyReturn(myStock, type = "arithmetic")
+  myReturns <- bmkReturns*sig
+  names(bmkReturns) <- 'BH'
+  names(myReturns) <- 'Me'  ## paste(names(ts),".on.",names(myStock),sep="")
+  tt <- na.omit(merge(bmkReturns,myReturns))
+  n_windows = nrow(tt) - w_size
+  if(n_windows<1) stop("Window size too large")
+  
+  perform = foreach(i=1:n_windows, .combine = rbind) %do%{
+    bhStra = tt$BH[i:(w_size+i-1),]
+    myStra = tt$Me[i:(w_size+i-1),]
+    per=rbind(BH=Performance(bhStra),Me=Performance(myStra))
+    return(per)
+  }
+  
+  bhindx = seq(1,2*n_windows,2); meindx = seq(2,2*n_windows,2)
+  BHmeans = colMeans2(perform,rows = bhindx)
+  MEmeans = colMeans2(perform,rows = meindx)
+  MeanPerf=rbind(BHmeans,MEmeans)
+  colnames(MeanPerf)=colnames(perform)
+  rownames(MeanPerf)=c("BH","Me")
+  return(list("AvgPerf"=MeanPerf,"NumWindows"=n_windows))
+}
+```
+
+# Initiallize Params
+```{r}
+result <- list()
+for(e in 1:dim(exp_val)[2]){
+  ev <- exp_val[,e]
+  for(n in win_size){
+    for(l in long_short){
+      for(i in s){
+        for(j in m){
+          ##Run tests for ev = {positiveP,negativeP,BULL,BEAR,BBr,PNr}
+          ## (s,m) = {5,10,15,20}x{25,50,100}
+          
+          ##Full period test
+          #testMAStrategy(target,ts=ev,s=i,m=j,longshort = l)
+          
+          ##Plot the MA(10) blue, MA(25) red, crossover
+          #plot(SMA(target,i),col="blue",main = " ",lty=2)  ##"Cruces de MM(10) y MM(25) para JPM"
+          #lines(SMA(target,j),col="red")
+          
+          ##Average Performance of MA crossover over fixed length periods (window_size= 1 yr, 6 mon) 
+          ##using Rolling windows. Window size 252 (a year of daily data) or 252/2 for 6 mon
+          ##Number of windows = full_period - window_size
+          meanperf = RollingTestMAStrategy(myStock=target,ts =ev,s=i, m=j,longshort=l,w_size=n)
+          #View(meanperf$AvgPerf)
+          temp <- as.data.frame(meanperf$AvgPerf)
+          temp$s <- c(i,i)
+          temp$m <- c(j,j)
+          temp$long.short <- c(l,l)
+          temp$win.size <- c(n,n)
+          temp$ev <- c(colnames(exp_val[,e]),colnames(exp_val[,e]))
+          result <- rbind(result, temp)
+          
+        }
+      }
+    }
+  }
+}
+
+```
+
+# Save Results
+```{r}
+write.csv(result,"C:\\Users\\a\\Desktop\\result.csv", row.names = TRUE)
+result
+```
+
+```{r}
+result <- read.csv('result.csv')
+for(i in 1:dim(result)[1]){
+    if(i%%2==0){
+      result$premium[i] <- result$Annual.Return[i]-result$Annual.Return[i-1]
+  }
+}
+#hist(result$premium)
+
+hist_info <- hist(result$premium, plot = FALSE)         # Store output of hist function
+hist_info$density <- hist_info$counts /    # Compute density values
+  sum(hist_info$counts) * 100
+plot(hist_info, freq = FALSE, main='Rolling Moving Average Backtesting premium'
+     , xlab = 'Premium', border="blue", col="green", ylim = c(0,105))
+text(hist_info$breaks+0.05,hist_info$density+5,labels=as.character(round(hist_info$density,2)))
+```
+
+```{r}
+#!is.na(result$premium[i]
+tab1 <- data.frame()
+for(i in 1:dim(result)[1]){
+  if(i%%2==0){
+      if(result$premium[i]>= 0.2){
+        tab1 <- rbind(tab1, result[i,], result[i-1,])
+    } 
+  }
+}
+write.csv(tab1,"C:\\Users\\a\\Desktop\\tab1.csv", row.names = TRUE)
+```
+
+
+
+
+```{r}
+tab2 <- data.frame()
+for(i in 1:dim(result)[1]){
+  if(i%%2==0){
+      if(result$premium[i]<= -0.2){
+        tab2 <- rbind(tab2, result[i,], result[i-1,])
+    } 
+  }
+}
+write.csv(tab2,"C:\\Users\\a\\Desktop\\tab2.csv", row.names = FALSE)
+```
+
+```{r}
+tab3 <- data.frame()
+for(i in 1:dim(result)[1]){
+  if(i%%2==0){
+      if(result$premium[i]> 0){
+        tab3 <- rbind(tab3, result[i,], result[i-1,])
+    } 
+  }
+}
+write.csv(tab3,"C:\\Users\\a\\Desktop\\tab3.csv", row.names = FALSE)
+```
+
+```{r}
+tab4 <- data.frame()
+for(i in 1:dim(result)[1]){
+  if(i%%2==0){
+      if(result$premium[i]< 0 && result$premium[i]> -0.2){
+        tab4 <- rbind(tab4, result[i,], result[i-1,])
+    } 
+  }
+}
+write.csv(tab4,"C:\\Users\\a\\Desktop\\tab4.csv", row.names = FALSE)
+```
+
+# My Own Trading Strategy
+```{r}
+bull.side <- positivePartscr*(1+certaintyPartscr)*(1+finupPartscr)
+bear.side <- negativePartscr*(1+uncertaintyPartscr)*(1+findownPartscr)
+sentimator <- bull.side - bear.side
+colnames(sentimator)
+```
+
+
+
+```{r}
+result2 <- list()
+ev <- sentimator
+for(n in win_size){
+  for(l in long_short){
+    for(i in s){
+      for(j in m){
+        ##Run tests for ev = {positiveP,negativeP,BULL,BEAR,BBr,PNr}
+        ## (s,m) = {5,10,15,20}x{25,50,100}
+        
+        ##Full period test
+        #testMAStrategy(target,ts=ev,s=i,m=j,longshort = l)
+        
+        ##Plot the MA(10) blue, MA(25) red, crossover
+        #plot(SMA(target,i),col="blue",main = " ",lty=2)  ##"Cruces de MM(10) y MM(25) para JPM"
+        #lines(SMA(target,j),col="red")
+        
+        ##Average Performance of MA crossover over fixed length periods (window_size= 1 yr, 6 mon) 
+        ##using Rolling windows. Window size 252 (a year of daily data) or 252/2 for 6 mon
+        ##Number of windows = full_period - window_size
+        meanperf = RollingTestMAStrategy(myStock=target,ts =ev,s=i, m=j,longshort=l,w_size=n)
+        #View(meanperf$AvgPerf)
+        temp <- as.data.frame(meanperf$AvgPerf)
+        temp$s <- c(i,i)
+        temp$m <- c(j,j)
+        temp$long.short <- c(l,l)
+        temp$win.size <- c(n,n)
+        temp$ev <- c(colnames(ev),colnames(ev))
+        result2 <- rbind(result2, temp)
+        
+      }
+    }
+  }
+}
+
+```
+
+
+```{r}
+write.csv(result2,"C:\\Users\\a\\Desktop\\result2.csv", row.names = TRUE)
+```
+
+```{r}
+result2 <- read.csv('result2.csv')
+for(i in 1:dim(result2)[1]){
+    if(i%%2==0){
+      result2$premium[i] <- result2$Annual.Return[i]-result2$Annual.Return[i-1]
+  }
+}
+#hist(result$premium)
+
+hist_info <- hist(result2$premium, plot = FALSE)         # Store output of hist function
+hist_info$density <- hist_info$counts /    # Compute density values
+  sum(hist_info$counts) * 100
+plot(hist_info, freq = FALSE, main='Rolling Moving Average Backtesting premium'
+     , xlab = 'Premium', border="blue", col="green", ylim = c(0,105))
+text(hist_info$breaks+0.03,hist_info$density+5,labels=as.character(round(hist_info$density,2)))
+```
+
+
+```{r}
+#new rolling strategy
+RollingTestMAStrategy2 <- function(myStock,ts =myStock,s=5, m=20,longshort=0,w_size=252) {
+  myPosition <- sig <- Lag(ifelse(ts>0, 1, longshort),1)
+  bmkReturns <- dailyReturn(myStock, type = "arithmetic")
+  myReturns <- bmkReturns*sig
+  names(bmkReturns) <- 'BH'
+  names(myReturns) <- 'Me'  ## paste(names(ts),".on.",names(myStock),sep="")
+  tt <- na.omit(merge(bmkReturns,myReturns))
+  n_windows = nrow(tt) - w_size
+  if(n_windows<1) stop("Window size too large")
+  
+  perform = foreach(i=1:n_windows, .combine = rbind) %do%{
+    bhStra = tt$BH[i:(w_size+i-1),]
+    myStra = tt$Me[i:(w_size+i-1),]
+    per=rbind(BH=Performance(bhStra),Me=Performance(myStra))
+    return(per)
+  }
+  
+  bhindx = seq(1,2*n_windows,2); meindx = seq(2,2*n_windows,2)
+  BHmeans = colMeans2(perform,rows = bhindx)
+  MEmeans = colMeans2(perform,rows = meindx)
+  MeanPerf=rbind(BHmeans,MEmeans)
+  colnames(MeanPerf)=colnames(perform)
+  rownames(MeanPerf)=c("BH","Me")
+  return(list("AvgPerf"=MeanPerf,"NumWindows"=n_windows))
+}
+
+```
+
+```{r}
+result3 <- list()
+
+ev <- sentimator
+for(n in win_size){
+  for(l in long_short){
+    for(i in s){
+      for(j in m){
+        ##Run tests for ev = {positiveP,negativeP,BULL,BEAR,BBr,PNr}
+        ## (s,m) = {5,10,15,20}x{25,50,100}
+        
+        ##Full period test
+        #testMAStrategy(target,ts=ev,s=i,m=j,longshort = l)
+        
+        ##Plot the MA(10) blue, MA(25) red, crossover
+        #plot(SMA(target,i),col="blue",main = " ",lty=2)  ##"Cruces de MM(10) y MM(25) para JPM"
+        #lines(SMA(target,j),col="red")
+        
+        ##Average Performance of MA crossover over fixed length periods (window_size= 1 yr, 6 mon) 
+        ##using Rolling windows. Window size 252 (a year of daily data) or 252/2 for 6 mon
+        ##Number of windows = full_period - window_size
+        meanperf = RollingTestMAStrategy2(myStock=target,ts =ev,s=i, m=j,longshort=l,w_size=n)
+        #View(meanperf$AvgPerf)
+        temp <- as.data.frame(meanperf$AvgPerf)
+        temp$s <- c(i,i)
+        temp$m <- c(j,j)
+        temp$long.short <- c(l,l)
+        temp$win.size <- c(n,n)
+        temp$ev <- c(colnames(ev),colnames(ev))
+        result3 <- rbind(result3, temp)
+        
+      }
+    }
+  }
+}
+write.csv(result3,"C:\\Users\\a\\Desktop\\result3.csv", row.names = TRUE)
+```
+
+```{r}
+result3 <- read.csv('result3.csv')
+
+for(i in 1:dim(result3)[1]){
+    if(i%%2==0){
+      result3$premium[i] <- result3$Annual.Return[i]-result3$Annual.Return[i-1]
+  }
+}
+#hist(result$premium)
+
+hist_info <- hist(result3$premium, plot = FALSE)         # Store output of hist function
+hist_info$density <- hist_info$counts /    # Compute density values
+  sum(hist_info$counts) * 100
+plot(hist_info, freq = FALSE, main='Rolling Moving Average Backtesting premium'
+     , xlab = 'Premium', border="blue", col="green", ylim = c(0,105))
+text(hist_info$breaks+0.05,hist_info$density+5,labels=as.character(round(hist_info$density,2)))
+```
+
+
+# cum.sentimator
+```{r}
+
+cum.sentimator <- cumsum(sentimator)
+
+result4 <- list()
+ev <- cum.sentimator
+for(n in win_size){
+  for(l in long_short){
+    for(i in s){
+      for(j in m){
+        ##Run tests for ev = {positiveP,negativeP,BULL,BEAR,BBr,PNr}
+        ## (s,m) = {5,10,15,20}x{25,50,100}
+        
+        ##Full period test
+        #testMAStrategy(target,ts=ev,s=i,m=j,longshort = l)
+        
+        ##Plot the MA(10) blue, MA(25) red, crossover
+        #plot(SMA(target,i),col="blue",main = " ",lty=2)  ##"Cruces de MM(10) y MM(25) para JPM"
+        #lines(SMA(target,j),col="red")
+        
+        ##Average Performance of MA crossover over fixed length periods (window_size= 1 yr, 6 mon) 
+        ##using Rolling windows. Window size 252 (a year of daily data) or 252/2 for 6 mon
+        ##Number of windows = full_period - window_size
+        meanperf = RollingTestMAStrategy(myStock=target,ts =ev,s=i, m=j,longshort=l,w_size=n)
+        #View(meanperf$AvgPerf)
+        temp <- as.data.frame(meanperf$AvgPerf)
+        temp$s <- c(i,i)
+        temp$m <- c(j,j)
+        temp$long.short <- c(l,l)
+        temp$win.size <- c(n,n)
+        temp$ev <- c(colnames(ev),colnames(ev))
+        result4 <- rbind(result4, temp)
+        
+      }
+    }
+  }
+}
+
+write.csv(result4,"C:\\Users\\a\\Desktop\\result4.csv", row.names = TRUE)
+
+```
+
+```{r}
+result4 <- read.csv('result4.csv')
+
+for(i in 1:dim(result4)[1]){
+    if(i%%2==0){
+      result4$premium[i] <- result4$Annual.Return[i]-result4$Annual.Return[i-1]
+  }
+}
+#hist(result$premium)
+
+hist_info <- hist(result4$premium, plot = FALSE)         # Store output of hist function
+hist_info$density <- hist_info$counts /    # Compute density values
+  sum(hist_info$counts) * 100
+plot(hist_info, freq = FALSE, main='Rolling Moving Average Backtesting premium'
+     , xlab = 'Premium', border="blue", col="green", ylim = c(0,105))
+text(hist_info$breaks+0.01,hist_info$density+5,labels=as.character(round(hist_info$density,2)))
+```
+
+```{r}
+bull.side <- positivePartscr*(1+certaintyPartscr)*(1+finupPartscr)
+bear.side <- negativePartscr*(1+uncertaintyPartscr)*(1+findownPartscr)
+sentimator2 <- bull.side + bear.side
+colnames(sentimator2)
+```
+
+```{r}
+
+
+result5 <- list()
+ev <- sentimator2
+for(n in win_size){
+  for(l in long_short){
+    for(i in s){
+      for(j in m){
+        ##Run tests for ev = {positiveP,negativeP,BULL,BEAR,BBr,PNr}
+        ## (s,m) = {5,10,15,20}x{25,50,100}
+        
+        ##Full period test
+        #testMAStrategy(target,ts=ev,s=i,m=j,longshort = l)
+        
+        ##Plot the MA(10) blue, MA(25) red, crossover
+        #plot(SMA(target,i),col="blue",main = " ",lty=2)  ##"Cruces de MM(10) y MM(25) para JPM"
+        #lines(SMA(target,j),col="red")
+        
+        ##Average Performance of MA crossover over fixed length periods (window_size= 1 yr, 6 mon) 
+        ##using Rolling windows. Window size 252 (a year of daily data) or 252/2 for 6 mon
+        ##Number of windows = full_period - window_size
+        meanperf = RollingTestMAStrategy(myStock=target,ts =ev,s=i, m=j,longshort=l,w_size=n)
+        #View(meanperf$AvgPerf)
+        temp <- as.data.frame(meanperf$AvgPerf)
+        temp$s <- c(i,i)
+        temp$m <- c(j,j)
+        temp$long.short <- c(l,l)
+        temp$win.size <- c(n,n)
+        temp$ev <- c(colnames(ev),colnames(ev))
+        result5 <- rbind(result5, temp)
+        
+      }
+    }
+  }
+}
+write.csv(result5,"C:\\Users\\a\\Desktop\\result5.csv", row.names = TRUE)
+```
+
+```{r}
+result5 <- read.csv('result5.csv')
+for(i in 1:dim(result5)[1]){
+    if(i%%2==0){
+      result5$premium[i] <- result5$Annual.Return[i]-result5$Annual.Return[i-1]
+  }
+}
+#hist(result$premium)
+
+hist_info <- hist(result5$premium, plot = FALSE)         # Store output of hist function
+hist_info$density <- hist_info$counts /    # Compute density values
+  sum(hist_info$counts) * 100
+plot(hist_info, freq = FALSE, main='Rolling Moving Average Backtesting premium'
+     , xlab = 'Premium', border="blue", col="green", ylim = c(0,105))
+text(hist_info$breaks+0.03,hist_info$density+5,labels=as.character(round(hist_info$density,2)))
+```
+
+```{r}
+bull.side <- positivePartscr*(1+certaintyPartscr)*(1+finupPartscr)
+bear.side <- negativePartscr*(1+uncertaintyPartscr)*(1+findownPartscr)
+sentimator3 <- (1+bull.side) * (1+bear.side)
+colnames(sentimator3)
+```
+
+```{r}
+result6 <- list()
+ev <- sentimator3
+for(n in win_size){
+  for(l in long_short){
+    for(i in s){
+      for(j in m){
+        ##Run tests for ev = {positiveP,negativeP,BULL,BEAR,BBr,PNr}
+        ## (s,m) = {5,10,15,20}x{25,50,100}
+        
+        ##Full period test
+        #testMAStrategy(target,ts=ev,s=i,m=j,longshort = l)
+        
+        ##Plot the MA(10) blue, MA(25) red, crossover
+        #plot(SMA(target,i),col="blue",main = " ",lty=2)  ##"Cruces de MM(10) y MM(25) para JPM"
+        #lines(SMA(target,j),col="red")
+        
+        ##Average Performance of MA crossover over fixed length periods (window_size= 1 yr, 6 mon) 
+        ##using Rolling windows. Window size 252 (a year of daily data) or 252/2 for 6 mon
+        ##Number of windows = full_period - window_size
+        meanperf = RollingTestMAStrategy(myStock=target,ts =ev,s=i, m=j,longshort=l,w_size=n)
+        #View(meanperf$AvgPerf)
+        temp <- as.data.frame(meanperf$AvgPerf)
+        temp$s <- c(i,i)
+        temp$m <- c(j,j)
+        temp$long.short <- c(l,l)
+        temp$win.size <- c(n,n)
+        temp$ev <- c(colnames(ev),colnames(ev))
+        result6 <- rbind(result6, temp)
+        
+      }
+    }
+  }
+}
+write.csv(result6,"C:\\Users\\a\\Desktop\\result6.csv", row.names = TRUE)
+```
+
+```{r}
+result6 <- read.csv('result6.csv')
+for(i in 1:dim(result6)[1]){
+    if(i%%2==0){
+      result6$premium[i] <- result6$Annual.Return[i]-result6$Annual.Return[i-1]
+  }
+}
+#hist(result$premium)
+
+hist_info <- hist(result6$premium, plot = FALSE)         # Store output of hist function
+hist_info$density <- hist_info$counts /    # Compute density values
+  sum(hist_info$counts) * 100
+plot(hist_info, freq = FALSE, main='Rolling Moving Average Backtesting premium'
+     , xlab = 'Premium', border="blue", col="green", ylim = c(0,105))
+text(hist_info$breaks+0.03,hist_info$density+5,labels=as.character(round(hist_info$density,2)))
+```
+```{r}
+result7 <- list()
+ev <- bull
+for(n in win_size){
+  for(l in long_short){
+    for(i in s){
+      for(j in m){
+        ##Run tests for ev = {positiveP,negativeP,BULL,BEAR,BBr,PNr}
+        ## (s,m) = {5,10,15,20}x{25,50,100}
+        
+        ##Full period test
+        #testMAStrategy(target,ts=ev,s=i,m=j,longshort = l)
+        
+        ##Plot the MA(10) blue, MA(25) red, crossover
+        #plot(SMA(target,i),col="blue",main = " ",lty=2)  ##"Cruces de MM(10) y MM(25) para JPM"
+        #lines(SMA(target,j),col="red")
+        
+        ##Average Performance of MA crossover over fixed length periods (window_size= 1 yr, 6 mon) 
+        ##using Rolling windows. Window size 252 (a year of daily data) or 252/2 for 6 mon
+        ##Number of windows = full_period - window_size
+        meanperf = RollingTestMAStrategy(myStock=target,ts =ev,s=i, m=j,longshort=l,w_size=n)
+        #View(meanperf$AvgPerf)
+        temp <- as.data.frame(meanperf$AvgPerf)
+        temp$s <- c(i,i)
+        temp$m <- c(j,j)
+        temp$long.short <- c(l,l)
+        temp$win.size <- c(n,n)
+        temp$ev <- c(colnames(ev),colnames(ev))
+        result7 <- rbind(result7, temp)
+        
+      }
+    }
+  }
+}
+write.csv(result7,"C:\\Users\\a\\Desktop\\result7.csv", row.names = TRUE)
+```
+
+```{r}
+result7 <- read.csv('result7.csv')
+for(i in 1:dim(result7)[1]){
+    if(i%%2==0){
+      result7$premium[i] <- result7$Annual.Return[i]-result7$Annual.Return[i-1]
+  }
+}
+#hist(result$premium)
+
+hist_info <- hist(result7$premium, plot = FALSE)         # Store output of hist function
+hist_info$density <- hist_info$counts /    # Compute density values
+  sum(hist_info$counts) * 100
+plot(hist_info, freq = FALSE, main='Rolling Moving Average Backtesting premium'
+     , xlab = 'Premium', border="blue", col="green", ylim = c(0,105))
+text(hist_info$breaks+0.03,hist_info$density+5,labels=as.character(round(hist_info$density,2)))
+```
+
+```{r}
+result8 <- list()
+ev <- bear
+for(n in win_size){
+  for(l in long_short){
+    for(i in s){
+      for(j in m){
+        ##Run tests for ev = {positiveP,negativeP,BULL,BEAR,BBr,PNr}
+        ## (s,m) = {5,10,15,20}x{25,50,100}
+        
+        ##Full period test
+        #testMAStrategy(target,ts=ev,s=i,m=j,longshort = l)
+        
+        ##Plot the MA(10) blue, MA(25) red, crossover
+        #plot(SMA(target,i),col="blue",main = " ",lty=2)  ##"Cruces de MM(10) y MM(25) para JPM"
+        #lines(SMA(target,j),col="red")
+        
+        ##Average Performance of MA crossover over fixed length periods (window_size= 1 yr, 6 mon) 
+        ##using Rolling windows. Window size 252 (a year of daily data) or 252/2 for 6 mon
+        ##Number of windows = full_period - window_size
+        meanperf = RollingTestMAStrategy(myStock=target,ts =ev,s=i, m=j,longshort=l,w_size=n)
+        #View(meanperf$AvgPerf)
+        temp <- as.data.frame(meanperf$AvgPerf)
+        temp$s <- c(i,i)
+        temp$m <- c(j,j)
+        temp$long.short <- c(l,l)
+        temp$win.size <- c(n,n)
+        temp$ev <- c(colnames(ev),colnames(ev))
+        result8 <- rbind(result8, temp)
+        
+      }
+    }
+  }
+}
+write.csv(result8,"C:\\Users\\a\\Desktop\\result8.csv", row.names = TRUE)
+
+```
+
+```{r}
+result8 <- read.csv('result8.csv')
+for(i in 1:dim(result8)[1]){
+    if(i%%2==0){
+      result8$premium[i] <- result8$Annual.Return[i]-result8$Annual.Return[i-1]
+  }
+}
+#hist(result$premium)
+
+hist_info <- hist(result8$premium, plot = FALSE)         # Store output of hist function
+hist_info$density <- hist_info$counts /    # Compute density values
+  sum(hist_info$counts) * 100
+plot(hist_info, freq = FALSE, main='Rolling Moving Average Backtesting premium'
+     , xlab = 'Premium', border="blue", col="green", ylim = c(0,105))
+text(hist_info$breaks+0.03,hist_info$density+5,labels=as.character(round(hist_info$density,2)))
+```
+
